@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Robot Camera XR</title>
+  <style>
+    body { margin: 0; background: #111; color: #ccc; font: 14px system-ui, sans-serif; }
+    form { position: fixed; top: 12px; left: 12px; display: flex; gap: 6px; align-items: center; }
+    input { width: 320px; }
+  </style>
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.169.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.169.0/examples/jsm/"
+      }
+    }
+  </script>
+</head>
+<body>
+  <form id="form">
+    <input id="url" placeholder="http://robot.local:8889/zed/whep">
+    <input id="ws" placeholder="ws://robot.local:8765">
+    <button>Connect</button>
+    <span id="status"></span>
+  </form>
+  <script type="module">
+    import * as THREE from 'three';
+    import { VRButton } from 'three/addons/webxr/VRButton.js';
+
+    const HFOV = 110; // ZED 2/2i; use 90 for ZED / ZED Mini
+    const DISTANCE = 2;
+
+    const video = document.createElement('video');
+    video.muted = video.playsInline = true;
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(innerWidth, innerHeight);
+    renderer.xr.enabled = true;
+    renderer.xr.setReferenceSpaceType('local-floor');
+    document.body.append(renderer.domElement, VRButton.createButton(renderer));
+
+    const scene = new THREE.Scene();
+    const camera = new THREE.PerspectiveCamera(70, innerWidth / innerHeight, 0.1, 100);
+    camera.position.set(0, 1.5, 3);
+    camera.layers.enable(1);
+
+    // In XR, three.js shows layer 1 to the left eye and layer 2 to the right eye
+    renderer.xr.addEventListener('sessionstart', () => camera.layers.disable(1));
+    renderer.xr.addEventListener('sessionend', () => camera.layers.enable(1));
+
+    const texture = new THREE.VideoTexture(video);
+    texture.colorSpace = THREE.SRGBColorSpace;
+    const screen = new THREE.Group();
+    screen.position.set(0, 1.5, -DISTANCE);
+    scene.add(screen);
+    for (const eye of [0, 1]) {
+      const geometry = new THREE.PlaneGeometry(1, 1);
+      const uv = geometry.attributes.uv;
+      for (let i = 0; i < uv.count; i++) uv.setX(i, (uv.getX(i) + eye) / 2);
+      const mesh = new THREE.Mesh(geometry, new THREE.MeshBasicMaterial({ map: texture }));
+      mesh.layers.set(eye + 1);
+      screen.add(mesh);
+    }
+
+    // Each video frame is painted into a cube map that is never cleared, shown dimmed as the background
+    const backgroundTarget = new THREE.WebGLCubeRenderTarget(1024);
+    backgroundTarget.clear(renderer);
+    const cubeCamera = new THREE.CubeCamera(0.1, 100, backgroundTarget);
+    cubeCamera.position.set(0, 1.5, 0);
+    const snapshotScene = new THREE.Scene();
+    const snapshot = new THREE.Mesh(
+      screen.children[0].geometry,
+      new THREE.MeshBasicMaterial({ map: texture, depthTest: false, depthWrite: false }),
+    );
+    snapshotScene.add(snapshot);
+    scene.background = backgroundTarget.texture;
+    scene.backgroundIntensity = 0.3;
+
+    const fit = () => {
+      const width = 2 * DISTANCE * Math.tan(THREE.MathUtils.degToRad(HFOV) / 2);
+      screen.scale.set(width, width * video.videoHeight / (video.videoWidth / 2), 1);
+    };
+    video.addEventListener('loadedmetadata', fit);
+    video.addEventListener('resize', fit);
+
+    let ws;
+    renderer.setAnimationLoop(() => {
+      if (video.readyState >= video.HAVE_CURRENT_DATA) {
+        snapshot.position.copy(screen.position);
+        snapshot.quaternion.copy(screen.quaternion);
+        snapshot.scale.copy(screen.scale);
+        renderer.autoClear = false;
+        cubeCamera.update(renderer, snapshotScene);
+        renderer.autoClear = true;
+      }
+      renderer.render(scene, camera);
+      if (renderer.xr.isPresenting && ws?.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ position: camera.position.toArray(), orientation: camera.quaternion.toArray() }));
+      }
+    });
+
+    const status = (text) => (document.getElementById('status').textContent = text);
+    let pc;
+    document.getElementById('form').addEventListener('submit', async (event) => {
+      event.preventDefault();
+      ws?.close();
+      ws = new WebSocket(document.getElementById('ws').value);
+      ws.onerror = () => status('pose socket error');
+      ws.onmessage = (e) => {
+        const { position, orientation } = JSON.parse(e.data);
+        cubeCamera.position.fromArray(position);
+        screen.quaternion.fromArray(orientation);
+        screen.position.fromArray(position).add(new THREE.Vector3(0, 0, -DISTANCE).applyQuaternion(screen.quaternion));
+      };
+      pc?.close();
+      pc = new RTCPeerConnection();
+      pc.addTransceiver('video', { direction: 'recvonly' });
+      pc.ontrack = (e) => { video.srcObject = e.streams[0]; video.play(); };
+      pc.onconnectionstatechange = () => status(pc.connectionState);
+      try {
+        await pc.setLocalDescription(await pc.createOffer());
+        await new Promise((resolve) => {
+          pc.onicegatheringstatechange = () => pc.iceGatheringState === 'complete' && resolve();
+          setTimeout(resolve, 2000);
+        });
+        const res = await fetch(document.getElementById('url').value, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/sdp' },
+          body: pc.localDescription.sdp,
+        });
+        if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+        await pc.setRemoteDescription({ type: 'answer', sdp: await res.text() });
+      } catch (err) {
+        status(err.message);
+      }
+    });
+  </script>
+</body>
+</html>

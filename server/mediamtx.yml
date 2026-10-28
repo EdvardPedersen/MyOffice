@@ -1,0 +1,7 @@
+paths:
+  zed:
+    runOnInit: >
+      ffmpeg -f v4l2 -input_format yuyv422 -video_size 2560x720 -framerate 30 -i /dev/video0
+      -c:v libx264 -preset ultrafast -tune zerolatency -pix_fmt yuv420p -b:v 8M -g 30
+      -f rtsp rtsp://localhost:$RTSP_PORT/$MTX_PATH
+    runOnInitRestart: yes
